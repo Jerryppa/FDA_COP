@@ -640,6 +640,30 @@ server <- function(input, output, session) {
   # 09 | DESIGN: STAGE TIMING
   # ==========================================================================
   
+  continuation_controls <- function(gate) {
+    defs <- definitions()
+    if (length(defs$stages) != 2L) return(helpText("Requires a two-stage design."))
+    tagList(
+      checkboxInput(paste0("gate", gate, "_enabled"), "Enable this continuation decision",
+                    saved(paste0("gate", gate, "_enabled"), FALSE)),
+      if (gate == 1L) numericInput("consolidation_time", "Consolidation start / decision time (t)",
+                                  saved("consolidation_time", 0.5), min = 0.001, step = 0.1),
+      textInput(paste0("gate", gate, "_continue"), "Continue when",
+                saved(paste0("gate", gate, "_continue"), if (gate == 1L) "CR / CRi and continuing" else "Blood count recovery and eligible")),
+      textInput(paste0("gate", gate, "_stop"), "Stop treatment when",
+                saved(paste0("gate", gate, "_stop"), if (gate == 1L) "Nonresponse, toxicity, or other discontinuation" else "Relapse, toxicity, or ineligibility")),
+      lapply(seq_len(read_arm_count()), function(i) numericInput(
+        paste0("gate", gate, "_p_", i), paste("Arm", i, "conditional probability of continuing"),
+        saved(paste0("gate", gate, "_p_", i), 1), min = 0, max = 1, step = 0.05)),
+      numericInput(paste0("gate", gate, "_hr"), "Post-stop OS hazard / stage-1 OS hazard",
+                   saved(paste0("gate", gate, "_hr"), 1), min = 0.001, step = 0.1),
+      helpText("Probabilities apply among patients alive, followed, and still on the pathway at this decision. These are combined continuation probabilities, separate from the Truth tab's binary response. Reason labels are descriptive; individual reasons are not sampled."),
+      helpText("Consolidation uses the stage-1 OS hazard. After stopping, the selected hazard multiplier applies for all remaining follow-up. Neither decision causes censoring.")
+    )
+  }
+  output$continuation1_controls <- renderUI(continuation_controls(1L))
+  output$continuation2_controls <- renderUI(continuation_controls(2L))
+
   output$timing_controls <- renderUI({
     defs <- definitions()
     
@@ -653,7 +677,7 @@ server <- function(input, output, session) {
     
     numericInput(
       "stage2_time",
-      "Stage 2 start / response-assessment time",
+      "Maintenance start / continuation decision time (t)",
       value = saved(
         "stage2_time",
         1
@@ -805,6 +829,19 @@ server <- function(input, output, session) {
         stop("Maximum follow-up must exceed the stage-2 start time.")
       }
       
+      continuation <- lapply(1:2, function(g) {
+        enabled <- has_stage2 && isTRUE(input[[paste0("gate", g, "_enabled")]])
+        list(enabled = enabled,
+             time = if (g == 1L && enabled) read_number("consolidation_time", "consolidation time", lower = 0.001) else transition_time,
+             probability = if (enabled) vapply(seq_len(n), function(i)
+               read_number(paste0("gate", g, "_p_", i), "continuation probability", 0, 1), numeric(1)) else rep(1, n),
+             stop_hr = if (enabled) read_number(paste0("gate", g, "_hr"), "post-stop hazard multiplier", lower = 0.001) else 1,
+             continue_label = input[[paste0("gate", g, "_continue")]] %||% "Eligible and continuing",
+             stop_label = input[[paste0("gate", g, "_stop")]] %||% "Stop treatment")
+      })
+      if (continuation[[1]]$enabled && continuation[[1]]$time >= transition_time)
+        stop("Consolidation must start before maintenance.")
+
       arms <- lapply(seq_len(n), function(i) {
         treatment <- input[[
           paste0("arm_drug_", i)
@@ -877,6 +914,7 @@ server <- function(input, output, session) {
       list(
         stages = defs$stages,
         transition_time = transition_time,
+        continuation = continuation,
         allocation = allocation,
         arms = arms,
         
@@ -1737,7 +1775,8 @@ server <- function(input, output, session) {
     if (length(design$stages) == 2L) {
       grid <- sort(unique(c(
         grid,
-        design$transition_time
+        design$transition_time,
+        if (isTRUE(design$continuation[[1]]$enabled)) design$continuation[[1]]$time
       )))
     }
     
@@ -1960,6 +1999,14 @@ server <- function(input, output, session) {
       
       # With shareX=TRUE, both panels use the same x axis.
       shapes[[2]]$xref <- "x"
+      if (isTRUE(design$continuation[[1]]$enabled)) {
+        extra <- lapply(shapes, function(shape) {
+          shape$x0 <- shape$x1 <- design$continuation[[1]]$time
+          shape$line$color <- "#337ab7"
+          shape
+        })
+        shapes <- c(shapes, extra)
+      }
     }
     
     figure <- plotly::layout(

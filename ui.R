@@ -40,6 +40,12 @@ ui <- navbarPage(
         font-size: 16px;
       }
 
+      summary, h3, h4, h5 {
+        background: #e7f0fb; border-left: 4px solid #337ab7;
+        padding: 10px 12px; border-radius: 4px; color: #174a7e;
+      }
+      details { margin-bottom: 10px; }
+      .nav-tabs { margin-bottom: 16px; }
       .chart-panel {
         position: sticky;
         top: 15px;
@@ -276,6 +282,17 @@ ui <- navbarPage(
             uiOutput("timing_controls")
           ),
           
+          tags$details(
+            open = NA,
+            tags$summary("Treatment continuation decisions"),
+            br(),
+            helpText("Stopping treatment is not loss to follow-up. OS continues until death or ordinary censoring."),
+            tabsetPanel(
+              tabPanel("Induction → consolidation", uiOutput("continuation1_controls")),
+              tabPanel("Consolidation → maintenance", uiOutput("continuation2_controls"))
+            )
+          ),
+
           # --------------------------------------------------------------------------
           # DESIGN | INITIAL SAMPLE SIZE AND ADMINISTRATIVE CENSORING
           # --------------------------------------------------------------------------
@@ -631,7 +648,7 @@ ui <- navbarPage(
               "Bottom: Kaplan–Meier estimates from the selected dataset.",
               "Click a legend entry to hide/show an arm in both panels.",
               "Double-click to isolate an arm.",
-              "The dashed vertical line marks the stage transition."
+              "Dashed lines mark maintenance start and, when enabled, the consolidation decision."
             ),
             
             plotly::plotlyOutput(

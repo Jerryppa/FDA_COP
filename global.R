@@ -135,9 +135,20 @@ design_to_dot <- function(design) {
     'edge [color="#62748A", fontname="Arial", fontsize=10];'
   )
   
-  node <- function(id, label, shape = "box") {
+  # Colors belong to the initial randomized arm; decisions retain default styling.
+  arm_fills <- c("#DBEAFE", "#FFEDD5", "#D1FAE5", "#EDE9FE", "#FCE7F3", "#CFFAFE", "#FEF3C7", "#F1F5F9")
+  arm_borders <- c("#2563EB", "#C2410C", "#047857", "#7C3AED", "#BE185D", "#0E7490", "#A16207", "#475569")
+  if (length(design$arms) > length(arm_fills)) {
+    arm_fills <- grDevices::hcl.colors(length(design$arms), "Pastel 1")
+    arm_borders <- grDevices::hcl.colors(length(design$arms), "Dark 3")
+  }
+  node <- function(id, label, shape = "box", arm_color = NULL) {
     lines <<- c(lines, sprintf(
-      "%s [label=%s, shape=%s];", id, dot_quote(label), shape
+      "%s [label=%s, shape=%s%s];", id, dot_quote(label), shape,
+      if (is.null(arm_color)) "" else sprintf(
+        ", fillcolor=%s, color=%s, fontcolor=%s",
+        dot_quote(arm_fills[arm_color]), dot_quote(arm_borders[arm_color]), dot_quote("#172B4D")
+      )
     ))
   }
   
@@ -159,35 +170,59 @@ design_to_dot <- function(design) {
     
     node(a, paste0(
       arm$name, "\n", design$stages[1], ": ", arm$treatment
-    ))
+    ), arm_color = i)
     
     edge("start", a, pct(design$allocation[i]))
     
     if (length(design$stages) == 1L) next
     
+    pathway <- a
+    gates <- design$continuation
+    if (!is.null(gates) && isTRUE(gates[[1]]$enabled)) {
+      g <- gates[[1]]
+      decision <- paste0(a, "_cons_decision")
+      cons <- paste0(a, "_consolidation")
+      stop_node <- paste0(a, "_stop1")
+      node(decision, paste0("Continue to consolidation?\nt = ", g$time), "diamond")
+      edge(a, decision)
+      node(cons, "Consolidation")
+      edge(decision, cons, paste0(g$continue_label, "\n", pct(g$probability[i])))
+      node(stop_node, paste0("Stop treatment\n", g$stop_label, "\nContinue OS follow-up"))
+      edge(decision, stop_node, pct(1 - g$probability[i]))
+      pathway <- cons
+    }
     origin <- paste0(a, "_assessment")
     
     node(
       origin,
       paste0(
-        if (arm$response_based) "Response assessment" else "Stage transition",
+        "Continue to maintenance?",
         "\nt = ", design$transition_time
       ),
       "diamond"
     )
     
-    edge(a, origin)
+    edge(pathway, origin)
+    if (!is.null(gates) && isTRUE(gates[[2]]$enabled)) {
+      g <- gates[[2]]
+      stop_node <- paste0(a, "_stop2")
+      node(stop_node, paste0("Stop treatment\n", g$stop_label, "\nContinue OS follow-up"))
+      edge(origin, stop_node, pct(1 - g$probability[i]))
+    }
     
     for (j in seq_along(arm$branches)) {
       branch <- arm$branches[[j]]
       b <- paste0(a, "_branch", j)
       
-      label <- if (arm$response_based) branch$name else ""
+      label <- if (arm$response_based) branch$name else "Eligible and continuing"
+      if (!is.null(gates) && isTRUE(gates[[2]]$enabled))
+        label <- paste0(gates[[2]]$continue_label, "\n", pct(gates[[2]]$probability[i]),
+                        if (arm$response_based) paste0("; ", branch$name) else "")
       
       if (branch$action == "fixed") {
         node(b, paste0(
           design$stages[2], ": ", branch$treatments[1]
-        ))
+        ), arm_color = i)
         edge(origin, b, label)
         
       } else {
@@ -199,7 +234,7 @@ design_to_dot <- function(design) {
           
           node(t, paste0(
             design$stages[2], ": ", branch$treatments[k]
-          ))
+          ), arm_color = i)
           
           edge(b, t, pct(branch$allocation[k]))
         }
@@ -359,11 +394,28 @@ generate_trial <- function(truth, design) {
   second_probability <- rep(NA_real_, n)
   reached_stage2 <- rep(FALSE, n)
   
+  continuation1 <- continuation2 <- rep(NA, n)
+  stop_time <- rep(NA_real_, n)
+  stop_decision <- rep(NA_integer_, n)
   if (has_stage2) {
+    gates <- design$continuation
+    for (g in seq_along(gates)) {
+      gate <- gates[[g]]
+      if (!isTRUE(gate$enabled)) next
+      candidates <- which(first_event > gate$time & censor_time > gate$time & is.na(stop_time))
+      pass <- rbinom(length(candidates), 1L, gate$probability[arm[candidates]]) == 1L
+      if (g == 1L) continuation1[candidates] <- pass else continuation2[candidates] <- pass
+      stopped <- candidates[!pass]
+      stop_time[stopped] <- gate$time
+      stop_decision[stopped] <- g
+      death <- gate$time + exponential_time(first_hazard[stopped] * gate$stop_hr)
+      observed_time[stopped] <- pmin(death, censor_time[stopped])
+      event[stopped] <- as.integer(death <= censor_time[stopped])
+    }
     tau <- design$transition_time
     
     # Only observed, event-free patients undergo stage-2 assignment.
-    reached_stage2 <- first_event > tau & censor_time > tau
+    reached_stage2 <- first_event > tau & censor_time > tau & is.na(stop_time)
     eligible <- which(reached_stage2)
     
     for (i in eligible) {
@@ -434,6 +486,10 @@ generate_trial <- function(truth, design) {
       character(1)
     ),
     
+    continued_to_consolidation = continuation1,
+    continued_to_maintenance = continuation2,
+    treatment_stop_time = stop_time,
+    treatment_stop_decision = stop_decision,
     treatment1 = first_treatment,
     initial_probability = design$allocation[arm],
     reached_stage2 = reached_stage2,
@@ -663,9 +719,7 @@ true_arm_survival <- function(time, truth, design, arm_index) {
   tau <- design$transition_time
   after <- time > tau
   
-  if (!any(after)) {
-    return(survival)
-  }
+
   
   elapsed <- time[after] - tau
   mixture <- numeric(length(elapsed))
@@ -717,6 +771,25 @@ true_arm_survival <- function(time, truth, design, arm_index) {
   }
   
   survival[after] <- exp(-lambda1 * tau) * mixture
+  gates <- design$continuation
+  enabled <- Filter(function(g) isTRUE(g$enabled), gates)
+  if (length(enabled)) {
+    # Base curve describes patients who pass all decisions. Add disjoint stop paths.
+    result <- survival
+    for (q in seq_along(time)) {
+      mass <- 1
+      stopped_survival <- 0
+      for (gate in enabled) {
+        if (time[q] <= gate$time) next
+        p <- gate$probability[arm_index]
+        stopped_survival <- stopped_survival + mass * (1 - p) *
+          exp(-lambda1 * gate$time - lambda1 * gate$stop_hr * (time[q] - gate$time))
+        mass <- mass * p
+      }
+      result[q] <- mass * survival[q] + stopped_survival
+    }
+    survival <- result
+  }
   
   survival
 }
